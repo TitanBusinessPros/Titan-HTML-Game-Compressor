@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Titan HTML Game Compressor</title>
+<style>
+:root{--bg:#0b1220;--panel:#121c2e;--line:#293750;--text:#eef4ff;--muted:#9fb0ca;--accent:#55aaff;--good:#66d49a;--bad:#ff8080}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:Arial,sans-serif;display:grid;place-items:center;padding:24px}
+.card{width:min(720px,100%);background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:28px;box-shadow:0 16px 50px #0007}
+h1{margin:0 0 8px;font-size:28px}p{color:var(--muted);line-height:1.5}
+.drop{border:2px dashed #425573;border-radius:12px;padding:30px;text-align:center;margin:22px 0}
+input[type=file]{max-width:100%}
+button{border:0;border-radius:9px;padding:13px 20px;font-size:16px;font-weight:700;cursor:pointer;background:var(--accent);color:#07111e;margin-right:8px}
+button:disabled{opacity:.45;cursor:not-allowed}
+#download{background:var(--good)}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0}
+.stat{background:#0c1525;border:1px solid var(--line);border-radius:10px;padding:14px}
+.stat b{display:block;font-size:20px;margin-top:5px}
+label,.small{font-size:13px;color:var(--muted)}
+#status{min-height:24px;margin-top:16px}
+.ok{color:var(--good)}.err{color:var(--bad)}
+@media(max-width:600px){.stats{grid-template-columns:1fr}.card{padding:20px}}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Titan HTML Game Compressor</h1>
+<p>Compress large self-contained Titan game HTML files while preserving the embedded game stage. Everything runs locally in your browser.</p>
+<div class="drop">
+  <input id="file" type="file" accept=".html,.htm,text/html">
+  <p class="small">Your file is not uploaded anywhere.</p>
+</div>
+<div>
+  <button id="compress" disabled>Compress HTML</button>
+  <button id="download" disabled>Download Compressed File</button>
+</div>
+<div class="stats">
+  <div class="stat"><label>Original</label><b id="original">—</b></div>
+  <div class="stat"><label>Compressed</label><b id="final">—</b></div>
+  <div class="stat"><label>Saved</label><b id="saved">—</b></div>
+</div>
+<div id="status"></div>
+</main>
+<script>
+const fileInput=document.getElementById('file');
+const compressBtn=document.getElementById('compress');
+const downloadBtn=document.getElementById('download');
+const statusEl=document.getElementById('status');
+let selectedFile=null,outputBlob=null,outputName='compressed-game.html';
+
+const fmt=n=>(n/1024/1024).toFixed(2)+' MiB';
+
+fileInput.onchange=()=>{
+ selectedFile=fileInput.files[0]||null; outputBlob=null;
+ compressBtn.disabled=!selectedFile; downloadBtn.disabled=true;
+ document.getElementById('original').textContent=selectedFile?fmt(selectedFile.size):'—';
+ document.getElementById('final').textContent='—';
+ document.getElementById('saved').textContent='—';
+ statusEl.textContent='';
+};
+
+function b64ToBytes(b64){
+ const bin=atob(b64), out=new Uint8Array(bin.length);
+ for(let i=0;i<bin.length;i++)out[i]=bin.charCodeAt(i);
+ return out;
+}
+function bytesToB64(bytes){
+ let s='',chunk=0x8000;
+ for(let i=0;i<bytes.length;i+=chunk)s+=String.fromCharCode(...bytes.subarray(i,i+chunk));
+ return btoa(s);
+}
+async function gzipBytes(bytes){
+ const stream=new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+ return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+function findDataObject(text){
+ const marker='const DATA = ';
+ const start=text.indexOf(marker);
+ if(start<0)throw new Error('Could not find "const DATA =" in this file.');
+ let i=start+marker.length,depth=0,inStr=false,esc=false,begin=-1;
+ for(;i<text.length;i++){
+   const c=text[i];
+   if(inStr){if(esc)esc=false;else if(c==='\\')esc=true;else if(c==='"')inStr=false;continue}
+   if(c==='"'){inStr=true;continue}
+   if(c==='{'){if(begin<0)begin=i;depth++}
+   else if(c==='}'){depth--;if(depth===0&&begin>=0)return {start:begin,end:i+1,json:text.slice(begin,i+1)}}
+ }
+ throw new Error('DATA object is incomplete.');
+}
+function addDecoderAndLoader(text){
+ const baseFn=`function base64ToText(b64) {
+  const binary = atob(b64);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}`;
+ const gzipFn=baseFn+`
+async function gzipBase64ToText(b64) {
+  const binary = atob(b64);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return await new Response(stream).text();
+}`;
+ if(!text.includes('gzipBase64ToText')){
+   if(!text.includes(baseFn))throw new Error('This exporter uses a loader format this version does not recognize.');
+   text=text.replace(baseFn,gzipFn);
+ }
+ const oldPlay=`function playStage(i) {
+  current = i;
+  const iframe = document.getElementById('stageFrame');
+  iframe.srcdoc = base64ToText(DATA.stages[i].htmlB64);
+  showScreen('playScreen');
+}`;
+ const newPlay=`async function playStage(i) {
+  current = i;
+  const iframe = document.getElementById('stageFrame');
+  iframe.srcdoc = DATA.stages[i].gzipB64
+    ? await gzipBase64ToText(DATA.stages[i].gzipB64)
+    : base64ToText(DATA.stages[i].htmlB64);
+  showScreen('playScreen');
+}`;
+ if(text.includes(oldPlay))text=text.replace(oldPlay,newPlay);
+ else if(!text.includes('DATA.stages[i].gzipB64'))throw new Error('Could not safely update the stage loader.');
+ return text;
+}
+function dedupeArt(data){
+ const refs=[];
+ if(typeof data.introArt==='string'&&data.introArt)refs.push({obj:data,key:'introArt',path:'DATA.introArt'});
+ if(typeof data.outroArt==='string'&&data.outroArt)refs.push({obj:data,key:'outroArt',path:'DATA.outroArt'});
+ if(Array.isArray(data.stages))data.stages.forEach((s,i)=>{
+   if(typeof s.art==='string'&&s.art)refs.push({obj:s,key:'art',path:`DATA.stages[${i}].art`});
+ });
+ const first=new Map(),assign=[];
+ for(const r of refs){
+   const val=r.obj[r.key];
+   if(first.has(val)){r.obj[r.key]='';assign.push(`${r.path} = ${first.get(val)};`)}
+   else first.set(val,r.path);
+ }
+ return assign;
+}
+
+compressBtn.onclick=async()=>{
+ try{
+  if(!('CompressionStream'in window)||!('DecompressionStream'in window))
+    throw new Error('Your browser does not support built-in gzip streams. Use a current Chrome or Edge browser.');
+  statusEl.className='';statusEl.textContent='Compressing…';
+  compressBtn.disabled=true;downloadBtn.disabled=true;
+  const text=await selectedFile.text();
+  const loc=findDataObject(text);
+  const data=JSON.parse(loc.json);
+  if(!Array.isArray(data.stages))throw new Error('No DATA.stages array found.');
+  let count=0;
+  for(const stage of data.stages){
+    if(stage.htmlB64){
+      const raw=b64ToBytes(stage.htmlB64);
+      const gz=await gzipBytes(raw);
+      stage.gzipB64=bytesToB64(gz);
+      delete stage.htmlB64; count++;
+    }
+  }
+  if(!count)throw new Error('No uncompressed htmlB64 stages were found.');
+  const assigns=dedupeArt(data);
+  const json=JSON.stringify(data);
+  // Insert dedupe assignments immediately after the exact DATA JSON boundary,
+  // never by searching through Base64 content.
+  const afterData=text.slice(loc.end);
+  const semiOffset=afterData.indexOf(';');
+  if(semiOffset<0)throw new Error('Could not find the end of the DATA declaration.');
+  const suffix=afterData.slice(0,semiOffset+1)+'\n'+(assigns.length?assigns.join('\n')+'\n':'')+afterData.slice(semiOffset+1);
+  let out=text.slice(0,loc.start)+json+suffix;
+  out=addDecoderAndLoader(out);
+
+  // Basic structural validation before allowing download.
+  if(!out.includes('<!DOCTYPE html>') || !out.includes('</html>') ||
+     !out.includes('renderIntro();') || !out.includes('gzipBase64ToText') ||
+     !out.includes('DATA.stages[i].gzipB64'))
+    throw new Error('Safety check failed; no output file was created.');
+
+  outputBlob=new Blob([out],{type:'text/html'});
+  outputName=selectedFile.name.replace(/\.html?$/i,'')+'-compressed.html';
+  document.getElementById('final').textContent=fmt(outputBlob.size);
+  const saved=selectedFile.size-outputBlob.size;
+  document.getElementById('saved').textContent=fmt(saved)+' ('+(saved/selectedFile.size*100).toFixed(1)+'%)';
+  statusEl.className='ok';
+  statusEl.textContent=`Done. Compressed ${count} stage${count===1?'':'s'} losslessly. Identical artwork copies were referenced once instead of stored repeatedly.`;
+  downloadBtn.disabled=false;
+ }catch(e){
+  statusEl.className='err';statusEl.textContent='Error: '+e.message;
+ }finally{compressBtn.disabled=false}
+};
+downloadBtn.onclick=()=>{
+ if(!outputBlob)return;
+ const a=document.createElement('a');
+ a.href=URL.createObjectURL(outputBlob);a.download=outputName;a.click();
+ setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+};
+</script>
+</body>
+</html>
